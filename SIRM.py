@@ -19,16 +19,53 @@ sys.path.insert(0, '../')
 sys.path.insert(0, '../../')
 
 from TensorFlow.Network import Network
-from TensorFlow.layers.SharedEmbedding import EmbeddingSharedWeights
-from TensorFlow.layers.FlipGradientBuilder import FlipGradientBuilder
-from TensorFlow.utility import get_position_encoding_matrix
-from TensorFlow.utility import show_layer_info_with_memory
+import math, resource
 
 
-class SIRM(Network):
-    def __init__(self, memory=0.5, **kwargs):
+class SIRM(object):
+    def __init__(self, maxlen=150, nb_classes=2, nb_words=2000,
+                 embedding_dim=200, dense_dim=200, rnn_dim=200, cnn_filters=200,
+                 dropout_rate=0.5, learning_rate=0.001, weight_decay=0.0, l2_reg_lambda=0.0, optim_type='adam',
+                 gpu='0', memory=0, data_struc='general', **kwargs):
 
-        Network.__init__(self, memory=memory)
+        self.logger = logging.getLogger("Tensorflow")
+
+        # data config
+        self.nb_classes = nb_classes
+        self.nb_words = nb_words
+
+        # network config
+        self.embedding_dim = embedding_dim
+        self.dense_dim = dense_dim
+        self.rnn_dim = rnn_dim
+        self.cnn_filters = cnn_filters
+        self.dropout_rate = dropout_rate
+
+        # self.initializer = tf.random_normal_initializer(stddev=0.1)
+        self.initializer = tf.truncated_normal_initializer(stddev=0.02)
+
+        # optimizer config
+        self.learning_rate = learning_rate
+        self.weight_decay = weight_decay
+        self.l2_reg_lambda = l2_reg_lambda
+        self.optim_type = optim_type
+
+        # session info config
+        self.gpu = gpu
+        self.memory = memory
+        self.data_struc = data_struc
+
+        if self.memory > 0:
+            num_threads = os.environ.get('OMP_NUM_THREADS')
+            self.logger.info("Memory use is %s." % self.memory)
+            gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=float(self.memory))
+            config = tf.ConfigProto(gpu_options=gpu_options, intra_op_parallelism_threads=num_threads)
+            self.sess = tf.Session(config=config)
+        else:
+            config = tf.ConfigProto()
+            config.gpu_options.allow_growth = True
+            self.sess = tf.Session(config=config)
+
         self.maxlen = 40
         self.sentmaxlen = 40
 
@@ -42,7 +79,7 @@ class SIRM(Network):
         self.mlp_af = tf.nn.relu
         self.transfer_bias = False
 
-        self.low_rate = 0.01
+        self.low_rate = 0.001
 
         self.kernel_sizes = [1, 2, 3]
 
@@ -466,6 +503,148 @@ class SIRM(Network):
         return total_loss/float(counter), total_accuracy/float(counter),\
                total_precision/float(counter), total_recall/float(counter), total_f1score/float(counter), \
                total_macro_f1score / float(counter), total_f0_5score/float(counter), total_f2score/float(counter)
+
+
+class EmbeddingSharedWeights(tf.layers.Layer):
+    """Calculates input embeddings and pre-softmax linear with shared weights."""
+
+    def __init__(self, vocab_size, hidden_size, method="gather"):
+        """Specify characteristic parameters of embedding layer.
+
+        Args:
+            vocab_size: Number of tokens in the embedding. (Typically ~32,000)
+            hidden_size: Dimensionality of the embedding. (Typically 512 or 1024)
+            method: Strategy for performing embedding lookup. "gather" uses tf.gather
+                which performs well on CPUs and GPUs, but very poorly on TPUs. "matmul"
+                one-hot encodes the indicies and formulates the embedding as a sparse
+                matrix multiplication. The matmul formulation is wasteful as it does
+                extra work, however matrix multiplication is very fast on TPUs which
+                makes "matmul" considerably faster than "gather" on TPUs.
+        """
+        super(EmbeddingSharedWeights, self).__init__()
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        if method not in ("gather", "matmul"):
+            raise ValueError("method {} must be 'gather' or 'matmul'".format(method))
+        self.method = method
+
+    def build(self, _):
+        with tf.variable_scope("embedding_and_softmax", reuse=tf.AUTO_REUSE):
+            # Create and initialize weights. The random normal initializer was chosen
+            # randomly, and works well.
+            self.shared_weights = tf.get_variable(
+                "weights", [self.vocab_size, self.hidden_size],
+                initializer=tf.random_normal_initializer(0., self.hidden_size ** -0.5)
+            )
+        self.built = True
+
+    def call(self, x):
+        """Get token embeddings of x.
+
+        Args:
+            x: An int64 tensor with shape [batch_size, length]
+        Returns:
+            embeddings: float32 tensor with shape [batch_size, length, embedding_size]
+            padding: float32 tensor with shape [batch_size, length] indicating the locations of the padding tokens in x.
+        """
+        with tf.name_scope("embedding"):
+            # Create binary mask of size [batch_size, length]
+            mask = tf.to_float(tf.not_equal(x, 0))
+
+            embeddings = tf.gather(self.shared_weights, x)
+            embeddings *= tf.expand_dims(mask, -1)
+            # embedding_matmul already zeros out masked positions, so
+            # `embeddings *= tf.expand_dims(mask, -1)` is unnecessary.
+
+            # Scale embedding by the sqrt of the hidden size
+            embeddings *= self.hidden_size ** 0.5
+
+            return embeddings
+
+    def linear(self, x):
+        """Computes logits by running x through a linear layer.
+
+        Args:
+            x: A float32 tensor with shape [batch_size, length, hidden_size]
+        Returns:
+            float32 tensor with shape [batch_size, length, vocab_size].
+        """
+        with tf.name_scope("presoftmax_linear"):
+            batch_size = tf.shape(x)[0]
+            length = tf.shape(x)[1]
+
+            x = tf.reshape(x, [-1, self.hidden_size])
+            logits = tf.matmul(x, self.shared_weights, transpose_b=True)
+
+            return tf.reshape(logits, [batch_size, length, self.vocab_size])
+
+
+class FlipGradientBuilder(object):
+    def __init__(self):
+        self.num_calls = 0
+
+    def __call__(self, x, l=1.0):
+        grad_name = "FlipGradient%d" % self.num_calls
+
+        @ops.RegisterGradient(grad_name)
+        def _flip_gradients(op, grad):
+            return [tf.negative(grad) * l]
+
+        g = tf.get_default_graph()
+        with g.gradient_override_map({"Identity": grad_name}):
+            y = tf.identity(x)
+
+        self.num_calls += 1
+        return y
+
+
+def get_position_encoding_matrix(length, hidden_size, min_timescale=1.0, max_timescale=1.0e4):
+    """Return positional encoding.
+
+    Calculates the position encoding as a mix of sine and cosine functions with
+    geometrically increasing wavelengths.
+    Defined and formulized in Attention is All You Need, section 3.5.
+
+    Args:
+        length: Sequence length.
+        hidden_size: Size of the
+        min_timescale: Minimum scale that will be applied at each position
+        max_timescale: Maximum scale that will be applied at each position
+
+    Returns:
+        Tensor with shape [length, hidden_size]
+    """
+    position = tf.to_float(tf.range(length))
+    num_timescales = hidden_size // 2
+    log_timescale_increment = (
+        math.log(float(max_timescale) / float(min_timescale)) /
+        (tf.to_float(num_timescales) - 1))
+    inv_timescales = min_timescale * tf.exp(
+        tf.to_float(tf.range(num_timescales)) * -log_timescale_increment)
+    scaled_time = tf.expand_dims(position, 1) * tf.expand_dims(inv_timescales, 0)
+    signal = tf.concat([tf.sin(scaled_time), tf.cos(scaled_time)], axis=1)
+    return signal
+
+
+def show_memory_use():
+    rusage_denom = 1024.
+    if sys.platform == 'darwin':
+        rusage_denom = rusage_denom * rusage_denom
+    ru = resource.getrusage(resource.RUSAGE_SELF)
+    total_memory = 1. * (ru.ru_maxrss + ru.ru_ixrss +
+                         ru.ru_idrss + ru.ru_isrss) / rusage_denom
+    strinfo = "\x1b[33m [Memory] Total Memory Use: %.4f MB \t Resident: %ld Shared: %ld UnshareData: %ld UnshareStack: %ld \x1b[0m" % \
+              (total_memory, ru.ru_maxrss, ru.ru_ixrss, ru.ru_idrss, ru.ru_isrss)
+    return strinfo
+
+
+def show_layer_info_with_memory(layer_name, layer_out, logger=None):
+    if logger:
+        logger.info('[layer]: %s\t[shape]: %s \n%s'
+                    % (layer_name, str(layer_out.get_shape().as_list()), show_memory_use()))
+    else:
+        print('[layer]: %s\t[shape]: %s \n%s'
+              % (layer_name, str(layer_out.get_shape().as_list()), show_memory_use()))
 
 
 if __name__ == '__main__':
